@@ -634,6 +634,9 @@
         <button class="chip" onclick="setQ('What percentage of Canadians are immigrants?')">🌍 Immigration</button>
         <button class="chip" onclick="setQ('What languages are spoken in Canada?')">💬 Languages</button>
         <button class="chip" onclick="setQ('What is the median household income in British Columbia?')">💰 BC income</button>
+        <button class="chip" onclick="setQ('Show me a bar chart of population by province')">📊 Province chart</button>
+        <button class="chip" onclick="setQ('Pie chart of visible minority groups in Toronto')">🥧 Toronto diversity pie</button>
+        <button class="chip" onclick="setQ('Bar chart of median income by province')">💹 Income by province</button>
       </div>
     </div>
 
@@ -642,7 +645,7 @@
         <div class="msg-row">
           <div class="avatar bot">🍁</div>
           <div class="bubble bot">
-            Hello! I'm connected to Statistics Canada's official 2021 Census database. Ask me anything about Canada's population, income, housing, immigration, languages, or regional demographics — I'll fetch real data and give you clear insights.
+            Hello! I'm connected to Statistics Canada's official 2021 Census database. Ask me anything about population, income, housing, immigration, or languages — and I can <strong>generate charts</strong> too. Try: <em>"Bar chart of population by province"</em> or <em>"Pie chart of languages in Canada"</em>.
           </div>
         </div>
       </div>
@@ -664,17 +667,20 @@
   Reproduction authorised for non-commercial purposes
 </footer>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script>
   let API_KEY = '';
   let busy = false;
   let history = [];
+  let chartCounter = 0;
 
+  // ── Geography & characteristic lookup tables ──
   const PROVINCE_CODES = {
     "canada": "2021A000011124", "newfoundland": "2021A000210", "pei": "2021A000211",
     "prince edward island": "2021A000211", "nova scotia": "2021A000212",
     "new brunswick": "2021A000213", "quebec": "2021A000224", "ontario": "2021A000235",
     "manitoba": "2021A000246", "saskatchewan": "2021A000247", "alberta": "2021A000248",
-    "british columbia": "2021A000259", "yukon": "2021A000260",
+    "british columbia": "2021A000259", "bc": "2021A000259", "yukon": "2021A000260",
     "northwest territories": "2021A000261", "nunavut": "2021A000262"
   };
 
@@ -684,22 +690,340 @@
     "edmonton": "2021A00248048007", "ottawa": "2021A00235505044",
     "winnipeg": "2021A00246602001", "quebec city": "2021A00242421005",
     "hamilton": "2021A00235537014", "kitchener": "2021A00235541013",
-    "london ontario": "2021A00235555032", "victoria": "2021A00259944030",
-    "halifax": "2021A00212205001", "saskatoon": "2021A00247725001",
-    "regina": "2021A00247724001"
+    "victoria": "2021A00259944030", "halifax": "2021A00212205001",
+    "saskatoon": "2021A00247725001", "regina": "2021A00247724001"
   };
 
   const CHAR_CODES = {
-    "total population": "1", "population": "1",
-    "median age": "13", "average age": "14",
-    "male population": "8", "female population": "9",
-    "immigrants": "1259", "non-permanent": "1296",
-    "english": "101", "french": "115",
-    "median income": "234", "average income": "235",
+    "total population": "1", "population": "1", "median age": "13", "average age": "14",
+    "male": "8", "female": "9", "immigrants": "1259", "non-permanent residents": "1296",
+    "english": "101", "french": "115", "median income": "234", "average income": "235",
     "median household income": "239", "average household income": "240",
-    "dwellings": "2", "private dwellings": "2",
-    "owned": "43", "rented": "44", "owner": "43", "renter": "44"
+    "owned dwellings": "43", "rented dwellings": "44", "private dwellings": "2"
   };
+
+  const ALL_PROVINCES = ["canada","newfoundland","pei","nova scotia","new brunswick",
+    "quebec","ontario","manitoba","saskatchewan","alberta","british columbia","yukon",
+    "northwest territories","nunavut"];
+
+  const CHART_COLORS = ['#c0392b','#2980b9','#27ae60','#e67e22','#8e44ad',
+    '#16a085','#d35400','#2c3e50','#1abc9c','#f39c12','#e74c3c','#3498db','#2ecc71','#95a5a6'];
+
+  // ── Tool definitions sent to Claude ──
+  const TOOLS = [
+    {
+      name: "fetch_province_data",
+      description: "Fetch a specific census characteristic for a Canadian province, territory, or all of Canada from the 2021 Census. Use this to get real data for provinces like Ontario, Quebec, British Columbia, Alberta, etc.",
+      input_schema: {
+        type: "object",
+        properties: {
+          geography: { type: "string", description: "Province/territory name or 'canada' for national data. E.g. 'ontario', 'british columbia', 'canada'" },
+          characteristic: { type: "string", description: "The census variable to fetch. E.g. 'population', 'median age', 'median household income', 'immigrants', 'english', 'french'" }
+        },
+        required: ["geography", "characteristic"]
+      }
+    },
+    {
+      name: "fetch_city_data",
+      description: "Fetch a specific census characteristic for a Canadian city or metro area from the 2021 Census. Use for cities like Toronto, Vancouver, Montreal, Calgary, Edmonton, Ottawa, etc.",
+      input_schema: {
+        type: "object",
+        properties: {
+          city: { type: "string", description: "City name. E.g. 'toronto', 'vancouver', 'montreal', 'calgary'" },
+          characteristic: { type: "string", description: "The census variable to fetch. E.g. 'population', 'median age', 'median household income', 'immigrants'" }
+        },
+        required: ["city", "characteristic"]
+      }
+    },
+    {
+      name: "fetch_all_provinces",
+      description: "Fetch a census characteristic for ALL provinces and territories at once. Use this when the user wants to compare provinces, see rankings, or create a chart across all of Canada.",
+      input_schema: {
+        type: "object",
+        properties: {
+          characteristic: { type: "string", description: "The census variable to fetch for all provinces. E.g. 'population', 'median age', 'median household income'" }
+        },
+        required: ["characteristic"]
+      }
+    },
+    {
+      name: "render_chart",
+      description: "Render a chart in the chat with census data. Use after fetching data when the user asks for a chart, graph, or visualization.",
+      input_schema: {
+        type: "object",
+        properties: {
+          chart_type: { type: "string", enum: ["bar", "pie", "doughnut", "line"], description: "Type of chart" },
+          title: { type: "string", description: "Chart title" },
+          labels: { type: "array", items: { type: "string" }, description: "X-axis labels or pie slice labels" },
+          data: { type: "array", items: { type: "number" }, description: "Numeric data values" },
+          unit: { type: "string", enum: ["number", "percent", "dollars"], description: "Unit type for formatting" },
+          insight: { type: "string", description: "One sentence key insight about the data" }
+        },
+        required: ["chart_type", "title", "labels", "data", "unit", "insight"]
+      }
+    }
+  ];
+
+  // ── Tool execution (runs locally in browser) ──
+  async function executeTool(name, input) {
+    if (name === "fetch_province_data") {
+      const geoKey = input.geography.toLowerCase().trim();
+      const charKey = input.characteristic.toLowerCase().trim();
+      const geoCode = PROVINCE_CODES[geoKey];
+      const charCode = findCharCode(charKey);
+      if (!geoCode) return { error: `Unknown geography: ${input.geography}. Try full province name.` };
+      if (!charCode) return { error: `Unknown characteristic: ${input.characteristic}` };
+      const val = await fetchSDMX(geoCode, charCode, 'pr');
+      if (val === null) return { error: "No data returned from Statistics Canada API" };
+      return { geography: input.geography, characteristic: input.characteristic, value: val, formatted: formatValue(val, charKey) };
+    }
+
+    if (name === "fetch_city_data") {
+      const cityKey = input.city.toLowerCase().trim();
+      const charKey = input.characteristic.toLowerCase().trim();
+      const geoCode = CITY_CODES[cityKey];
+      const charCode = findCharCode(charKey);
+      if (!geoCode) return { error: `Unknown city: ${input.city}. Try: toronto, vancouver, montreal, calgary, edmonton, ottawa, winnipeg, halifax, saskatoon, regina, victoria` };
+      if (!charCode) return { error: `Unknown characteristic: ${input.characteristic}` };
+      const val = await fetchSDMX(geoCode, charCode, 'cma');
+      if (val === null) return { error: "No data returned from Statistics Canada API" };
+      return { city: input.city, characteristic: input.characteristic, value: val, formatted: formatValue(val, charKey) };
+    }
+
+    if (name === "fetch_all_provinces") {
+      const charKey = input.characteristic.toLowerCase().trim();
+      const charCode = findCharCode(charKey);
+      if (!charCode) return { error: `Unknown characteristic: ${input.characteristic}` };
+      const results = {};
+      await Promise.all(ALL_PROVINCES.map(async prov => {
+        const geoCode = PROVINCE_CODES[prov];
+        const val = await fetchSDMX(geoCode, charCode, 'pr');
+        if (val !== null) results[prov] = { value: val, formatted: formatValue(val, charKey) };
+      }));
+      return { characteristic: input.characteristic, data: results };
+    }
+
+    if (name === "render_chart") {
+      renderChart(input);
+      return { success: true, message: `Chart rendered: ${input.title}` };
+    }
+
+    return { error: `Unknown tool: ${name}` };
+  }
+
+  function findCharCode(charKey) {
+    if (CHAR_CODES[charKey]) return CHAR_CODES[charKey];
+    for (const [k, v] of Object.entries(CHAR_CODES)) {
+      if (charKey.includes(k) || k.includes(charKey)) return v;
+    }
+    return null;
+  }
+
+  function formatValue(val, charKey) {
+    if (charKey.includes('income')) return '$' + Number(val).toLocaleString();
+    if (charKey.includes('age')) return Number(val).toFixed(1) + ' yrs';
+    return Number(val).toLocaleString();
+  }
+
+  async function fetchSDMX(geoCode, charCode, type) {
+    const flow = type === 'cma' ? 'DF_CMACA' : 'DF_PR';
+    const key = `A5.${geoCode}.1.${charCode}.1`;
+    const url = `https://api.statcan.gc.ca/census-recensement/profile/sdmx/rest/data/STC_CP,${flow},1.1/${key}?format=json`;
+    try {
+      const r = await fetch(url);
+      if (!r.ok) return null;
+      const d = await r.json();
+      const series = d?.data?.dataSets?.[0]?.series;
+      if (!series) return null;
+      const k0 = Object.keys(series)[0];
+      const obs = series[k0]?.observations;
+      if (!obs) return null;
+      return Object.values(obs)[0]?.[0] ?? null;
+    } catch { return null; }
+  }
+
+  // ── Agentic loop ──
+  async function runAgent(userQuestion) {
+    const systemPrompt = `You are an expert analyst for Canada's 2021 Census of Population (Statistics Canada).
+
+You have tools to fetch real census data and render charts. Use them proactively:
+- Always fetch real data before answering questions about specific numbers
+- For comparisons across provinces, use fetch_all_provinces
+- When users ask for charts or visualizations, fetch the data first then call render_chart
+- You can call multiple tools in sequence to build a complete answer
+- After fetching data, provide clear analysis with context and insights
+- Format large numbers with commas. Use % for percentages.
+- Do not mention SDMX, API internals, tool names, or technical details in your final response`;
+
+    const messages = [...history, { role: 'user', content: userQuestion }];
+    let iterMessages = [...messages];
+    let maxIterations = 8;
+
+    while (maxIterations-- > 0) {
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': API_KEY,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 4096,
+          system: systemPrompt,
+          tools: TOOLS,
+          messages: iterMessages
+        })
+      });
+
+      if (!resp.ok) {
+        const e = await resp.json().catch(() => ({}));
+        throw new Error(e?.error?.message || `API error ${resp.status}`);
+      }
+
+      const data = await resp.json();
+      const { content, stop_reason } = data;
+
+      // Collect any text blocks to show as thinking indicator
+      const textBlocks = content.filter(b => b.type === 'text');
+      const toolBlocks = content.filter(b => b.type === 'tool_use');
+
+      // If no tool calls, we have the final answer
+      if (stop_reason === 'end_turn' || toolBlocks.length === 0) {
+        const finalText = textBlocks.map(b => b.text).join('\n').trim();
+        history.push({ role: 'user', content: userQuestion });
+        history.push({ role: 'assistant', content: finalText || 'Done.' });
+        if (history.length > 20) history = history.slice(-20);
+        return finalText;
+      }
+
+      // Add assistant message with tool use to conversation
+      iterMessages.push({ role: 'assistant', content });
+
+      // Execute all tool calls and collect results
+      updateLoadingMsg(`Using ${toolBlocks.length} tool${toolBlocks.length > 1 ? 's' : ''}…`);
+      const toolResults = await Promise.all(toolBlocks.map(async tb => {
+        updateLoadingMsg(`Fetching: ${tb.input.geography || tb.input.city || tb.input.characteristic || tb.name}…`);
+        const result = await executeTool(tb.name, tb.input);
+        return {
+          type: 'tool_result',
+          tool_use_id: tb.id,
+          content: JSON.stringify(result)
+        };
+      }));
+
+      // Add tool results back into conversation
+      iterMessages.push({ role: 'user', content: toolResults });
+    }
+
+    return 'I reached the maximum number of steps. Please try a more specific question.';
+  }
+
+  // ── Chart rendering ──
+  function renderChart(spec) {
+    const log = document.getElementById('chat-log');
+    const row = document.createElement('div');
+    row.className = 'msg-row';
+    const av = document.createElement('div');
+    av.className = 'avatar bot';
+    av.textContent = '🍁';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble bot';
+    bubble.style.maxWidth = '95%';
+
+    const id = 'chart-' + (++chartCounter);
+    const wrapper = document.createElement('div');
+    wrapper.style.cssText = 'background:#fff;border:1px solid #eee;border-radius:10px;padding:16px;margin:4px 0;';
+    const titleEl = document.createElement('p');
+    titleEl.style.cssText = 'font-size:13px;font-weight:500;color:#333;margin:0 0 10px;';
+    titleEl.textContent = spec.title || '';
+    const canvas = document.createElement('canvas');
+    canvas.id = id;
+    canvas.style.cssText = 'max-height:280px;';
+    wrapper.appendChild(titleEl);
+    wrapper.appendChild(canvas);
+    bubble.appendChild(wrapper);
+
+    if (spec.insight) {
+      const ins = document.createElement('p');
+      ins.style.cssText = 'font-size:13px;color:#555;margin:10px 0 0;padding-top:8px;border-top:1px solid #eee;';
+      ins.textContent = '💡 ' + spec.insight;
+      bubble.appendChild(ins);
+    }
+
+    row.appendChild(av);
+    row.appendChild(bubble);
+    log.appendChild(row);
+    log.scrollTop = log.scrollHeight;
+
+    const isPie = spec.chart_type === 'pie' || spec.chart_type === 'doughnut';
+    const colors = isPie ? spec.labels.map((_, i) => CHART_COLORS[i % CHART_COLORS.length]) : CHART_COLORS[0];
+
+    setTimeout(() => {
+      new Chart(canvas, {
+        type: spec.chart_type || 'bar',
+        data: {
+          labels: spec.labels,
+          datasets: [{
+            label: spec.title || '',
+            data: spec.data,
+            backgroundColor: isPie ? colors : colors + '22',
+            borderColor: isPie ? colors : CHART_COLORS[0],
+            borderWidth: isPie ? 1 : 2,
+            borderRadius: spec.chart_type === 'bar' ? 4 : 0
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            legend: { display: isPie, position: 'right', labels: { font: { size: 11 }, boxWidth: 12 } },
+            tooltip: {
+              callbacks: {
+                label: ctx => {
+                  const v = ctx.parsed?.y ?? ctx.parsed;
+                  if (spec.unit === 'percent') return ` ${v}%`;
+                  if (spec.unit === 'dollars') return ` $${Number(v).toLocaleString()}`;
+                  return ` ${Number(v).toLocaleString()}`;
+                }
+              }
+            }
+          },
+          scales: isPie ? {} : {
+            y: {
+              beginAtZero: true,
+              ticks: {
+                font: { size: 11 },
+                callback: v => {
+                  if (spec.unit === 'percent') return v + '%';
+                  if (spec.unit === 'dollars') return '$' + (v >= 1e6 ? (v/1e6).toFixed(1)+'M' : v >= 1e3 ? (v/1e3).toFixed(0)+'K' : v);
+                  return v >= 1e6 ? (v/1e6).toFixed(1)+'M' : v >= 1e3 ? (v/1e3).toFixed(0)+'K' : v;
+                }
+              },
+              grid: { color: 'rgba(0,0,0,0.05)' }
+            },
+            x: { ticks: { font: { size: 11 } }, grid: { display: false } }
+          }
+        }
+      });
+    }, 50);
+  }
+
+  // ── UI helpers ──
+  let loadingRow = null;
+
+  function updateLoadingMsg(text) {
+    if (loadingRow) {
+      const bubble = loadingRow.querySelector('.bubble');
+      if (bubble) {
+        bubble.innerHTML = '';
+        const sp = document.createElement('div');
+        sp.className = 'spinner';
+        bubble.appendChild(sp);
+        bubble.appendChild(document.createTextNode(text));
+      }
+    }
+  }
 
   function saveKey() {
     const k = document.getElementById('api-key-input').value.trim();
@@ -728,23 +1052,18 @@
     const log = document.getElementById('chat-log');
     const row = document.createElement('div');
     row.className = 'msg-row' + (role === 'user' ? ' user' : '');
-
     const av = document.createElement('div');
     av.className = 'avatar ' + (role === 'user' ? 'user-av' : 'bot');
     av.textContent = role === 'user' ? 'YOU' : '🍁';
-
     const bubble = document.createElement('div');
     bubble.className = 'bubble ' + (role === 'user' ? 'user' : 'bot') + (loading ? ' loading' : '');
-
     if (loading) {
-      const sp = document.createElement('div');
-      sp.className = 'spinner';
+      const sp = document.createElement('div'); sp.className = 'spinner';
       bubble.appendChild(sp);
-      bubble.appendChild(document.createTextNode('Querying Statistics Canada…'));
+      bubble.appendChild(document.createTextNode(content || 'Thinking…'));
     } else {
-      bubble.innerHTML = content.replace(/\n/g, '<br>');
+      bubble.innerHTML = content;
     }
-
     row.appendChild(av);
     row.appendChild(bubble);
     log.appendChild(row);
@@ -752,74 +1071,46 @@
     return row;
   }
 
-  function detectGeo(q) {
-    const lower = q.toLowerCase();
-    for (const [name, code] of Object.entries(CITY_CODES)) {
-      if (lower.includes(name)) return { code, name, type: 'cma' };
+  function mdToHtml(md) {
+    let html = md
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/^### (.+)$/gm, '<h3 style="font-size:14px;font-weight:500;margin:12px 0 4px;">$1</h3>')
+      .replace(/^## (.+)$/gm, '<h2 style="font-size:15px;font-weight:500;margin:14px 0 6px;">$1</h2>')
+      .replace(/^# (.+)$/gm, '<h2 style="font-size:16px;font-weight:500;margin:14px 0 6px;">$1</h2>')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.+?)\*/g, '<em>$1</em>')
+      .replace(/`(.+?)`/g, '<code style="font-family:monospace;font-size:12px;background:rgba(0,0,0,0.06);padding:1px 5px;border-radius:4px;">$1</code>')
+      .replace(/^---+$/gm, '<hr style="border:none;border-top:1px solid #eee;margin:10px 0;">')
+      .replace(/^&gt; (.+)$/gm, '<blockquote style="border-left:3px solid #ccc;padding-left:10px;color:#666;margin:8px 0;font-size:13px;">$1</blockquote>')
+      .replace(/^\* (.+)$/gm, '<li style="margin:2px 0;">$1</li>')
+      .replace(/^- (.+)$/gm, '<li style="margin:2px 0;">$1</li>')
+      .replace(/(<li[^>]*>.*?<\/li>\n?)+/g, m => `<ul style="padding-left:18px;margin:6px 0;">${m}</ul>`);
+    const lines = html.split('\n');
+    const out = []; let inTable = false, tableRows = [];
+    for (const line of lines) {
+      const l = line.trim();
+      if (l.startsWith('|') && l.endsWith('|')) {
+        if (!inTable) { inTable = true; tableRows = []; }
+        tableRows.push(l);
+      } else {
+        if (inTable) { out.push(renderTableHtml(tableRows)); tableRows = []; inTable = false; }
+        out.push(l);
+      }
     }
-    for (const [name, code] of Object.entries(PROVINCE_CODES)) {
-      if (lower.includes(name)) return { code, name, type: 'pr' };
-    }
-    return null;
+    if (inTable) out.push(renderTableHtml(tableRows));
+    return out.join('\n')
+      .replace(/\n{2,}/g, '</p><p style="margin:6px 0;">')
+      .replace(/\n/g, ' ')
+      .replace(/^/, '<p style="margin:0;">').replace(/$/, '</p>');
   }
 
-  function detectChar(q) {
-    const lower = q.toLowerCase();
-    for (const [name, code] of Object.entries(CHAR_CODES)) {
-      if (lower.includes(name)) return { code, name };
-    }
-    return { code: '1', name: 'total population' };
-  }
-
-  async function fetchCensus(geoCode, charCode, type) {
-    const flow = type === 'cma' ? 'DF_CMACA' : 'DF_PR';
-    const key = `A5.${geoCode}.1.${charCode}.1`;
-    const url = `https://api.statcan.gc.ca/census-recensement/profile/sdmx/rest/data/STC_CP,${flow},1.1/${key}?format=json`;
-    try {
-      const r = await fetch(url);
-      if (!r.ok) return null;
-      const d = await r.json();
-      const series = d?.data?.dataSets?.[0]?.series;
-      if (!series) return null;
-      const k0 = Object.keys(series)[0];
-      const obs = series[k0]?.observations;
-      if (!obs) return null;
-      return Object.values(obs)[0]?.[0] ?? null;
-    } catch { return null; }
-  }
-
-  async function askClaude(question, censusContext) {
-    const system = `You are an expert analyst on Canada's 2021 Census of Population (Statistics Canada).
-When real API data is provided, use it precisely in your answer.
-When no data is available, draw from your knowledge of the 2021 Census.
-Be clear and insightful — include real numbers, context, trends, and comparisons.
-Format large numbers with commas. Use % for percentages.
-Keep responses to 2–4 paragraphs. Do not mention SDMX, API internals, or technical details.`;
-
-    const userMsg = censusContext
-      ? `Question: ${question}\n\nLive data from Statistics Canada:\n${censusContext}\n\nAnalyze this and provide clear insights.`
-      : `Question: ${question}`;
-
-    const msgs = [...history, { role: 'user', content: userMsg }];
-
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': API_KEY,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-      },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 1000, system, messages: msgs })
-    });
-
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err?.error?.message || `API error ${resp.status}`);
-    }
-
-    const data = await resp.json();
-    return data.content?.find(b => b.type === 'text')?.text || 'No response generated.';
+  function renderTableHtml(rows) {
+    const cells = r => r.slice(1, -1).split('|').map(c => c.trim());
+    const header = cells(rows[0]);
+    const body = rows.slice(2);
+    const th = header.map(h => `<th style="padding:6px 10px;border-bottom:2px solid #ddd;text-align:left;font-weight:500;font-size:13px;white-space:nowrap;">${h}</th>`).join('');
+    const trs = body.map(r => `<tr>${cells(r).map(c => `<td style="padding:6px 10px;border-bottom:1px solid #f0f0f0;font-size:13px;">${c}</td>`).join('')}</tr>`).join('');
+    return `<div style="overflow-x:auto;margin:10px 0;"><table style="width:100%;border-collapse:collapse;"><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table></div>`;
   }
 
   async function sendQ() {
@@ -834,33 +1125,17 @@ Keep responses to 2–4 paragraphs. Do not mention SDMX, API internals, or techn
     document.getElementById('send-btn').disabled = true;
 
     appendMsg('user', q);
-    const loadRow = appendMsg('bot', '', true);
+    loadingRow = appendMsg('bot', 'Thinking…', true);
 
     try {
-      const geo = detectGeo(q);
-      const char = detectChar(q);
-      let censusContext = null;
-
-      if (geo) {
-        const val = await fetchCensus(geo.code, char.code, geo.type);
-        if (val !== null && val !== undefined) {
-          const formatted = char.name.includes('income')
-            ? '$' + Number(val).toLocaleString()
-            : Number(val).toLocaleString();
-          censusContext = `Geography: ${geo.name}\nCharacteristic: ${char.name}\nValue: ${formatted}`;
-        }
+      const answer = await runAgent(q);
+      loadingRow.remove();
+      loadingRow = null;
+      if (answer && answer.trim()) {
+        appendMsg('bot', mdToHtml(answer));
       }
-
-      const answer = await askClaude(q, censusContext);
-      loadRow.remove();
-      appendMsg('bot', answer);
-
-      history.push({ role: 'user', content: q });
-      history.push({ role: 'assistant', content: answer });
-      if (history.length > 20) history = history.slice(-20);
-
     } catch (err) {
-      loadRow.remove();
+      if (loadingRow) { loadingRow.remove(); loadingRow = null; }
       appendMsg('bot', `⚠️ Error: ${err.message}`);
     }
 
